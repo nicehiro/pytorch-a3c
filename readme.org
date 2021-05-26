@@ -1,4 +1,6 @@
 * Asynchronous Advantage Actor-Critic Algorithm PyTorch Implementation
 - a3c
 - gae
-- retro
+
+
+Most of code are come from https://github.com/ikostrikov/pytorch-a3c and https://github.com/MorvanZhou/pytorch-A3C.

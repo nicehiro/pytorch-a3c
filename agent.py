@@ -7,9 +7,11 @@ import torch.optim as optim
 import time
 import torch.multiprocessing as mp
 from shared_optim import SharedAdam
+from movan import Net
+import os
 
 
-class Worker:
+class Worker(mp.Process):
     def __init__(
         self,
         rank,
@@ -31,6 +33,7 @@ class Worker:
         Train in the worker model, get the gradients, then send to
         the master model and optimize master model.
         """
+        super(Worker, self).__init__()
         torch.manual_seed(seed + rank)
         self.env = gym.make(env_name)
         self.env.seed(seed + rank)
@@ -39,13 +42,13 @@ class Worker:
         actions_n = self.env.action_space.n
         self.model = model(features_n, actions_n)
         # optimizer for master model
+        self.master_model = master_model
         self.lr = lr
         self.optimizer = (
             torch.optim.Adam(master_model.parameters(), lr=self.lr)
             if not optimizer
             else optimizer
         )
-        self.master_model = master_model
         # training settings
         self.episodes_n = episodes_n
         self.gamma = gamma
@@ -54,12 +57,11 @@ class Worker:
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
 
-    def train(self):
+    def run(self):
         """Training process using A3C."""
-        self.model.train()
+        os.environ["OMP_NUM_THREADS"] = "1"
+        # self.model.train()
         while True:
-            # synchronize thread-specific parameters
-            self.model.load_state_dict(self.master_model.state_dict())
             s = self.env.reset()
             d = True
 
@@ -71,7 +73,7 @@ class Worker:
 
             for step in range(self.episodes_n):
                 s = torch.from_numpy(s).type(torch.FloatTensor)
-                q, logit = self.model(s.unsqueeze(0))
+                logit, q = self.model(s.unsqueeze(0))
                 prob = F.softmax(logit, dim=-1)
                 log_prob = F.log_softmax(logit, dim=-1)
                 # entropy calc in discrete action space
@@ -102,7 +104,7 @@ class Worker:
             # for non-terminal s_{t}, bootstrap from last state
             if not d:
                 s = torch.from_numpy(s).type(torch.FloatTensor)
-                q, _ = self.model(s.unsqueeze(0))
+                _, q = self.model(s.unsqueeze(0))
                 R = q.detach()
             q_values.append(R)
 
@@ -134,6 +136,9 @@ class Worker:
             # update master model
             self.optimizer.step()
 
+            # synchronize thread-specific parameters
+            self.model.load_state_dict(self.master_model.state_dict())
+
     def ensure_master_grads(self):
         """Ensure worker's grads are pushed to master model."""
         for worker_params, master_params in zip(
@@ -144,27 +149,36 @@ class Worker:
                 return
             master_params.grad = worker_params.grad
 
-    def test(self):
+
+class Player(mp.Process):
+    def __init__(self, env_name, episodes_n, master_model):
+        super(Player, self).__init__()
+        self.env = gym.make(env_name)
+        self.episodes_n = episodes_n
+        self.master_model = master_model
+
+    def run(self):
         """Test current model."""
-        self.model.eval()
+
+        os.environ["OMP_NUM_THREADS"] = "1"
 
         while True:
-            time.sleep(60)
+            time.sleep(30)
 
             s = self.env.reset()
-            s = torch.from_numpy(s).type(torch.FloatTensor)
             reward_sum = 0
             times = 0
             start_time = time.time()
 
-            for _ in range(self.episodes_n):
+            for t in range(self.episodes_n):
+                s = torch.from_numpy(s).type(torch.FloatTensor)
                 times += 1
                 with torch.no_grad():
-                    q, logit = self.model(s.unsqueeze(0))
+                    logit, _ = self.master_model(s.unsqueeze(0))
                 prob = F.softmax(logit, dim=-1)
                 a = prob.max(1, keepdim=True)[1].numpy()
                 s_, r, d, _ = self.env.step(a[0, 0])
-                d = d
+                print("Step {}, Action {}".format(t, a[0, 0]))
                 reward_sum += r
                 s = s_
 
@@ -176,94 +190,3 @@ class Worker:
                     start_time, times, reward_sum
                 )
             )
-
-
-class Master:
-    def __init__(
-        self,
-        process_n,
-        seed,
-        env_name,
-        lr,
-        model,
-        shared_optimizer,
-        gamma,
-        gae_lambda,
-        entropy_coef,
-        value_loss_coef,
-    ) -> None:
-        self.process_n = process_n
-        self.seed = seed
-        self.env_name = env_name
-        self.env = gym.make(env_name)
-
-        self.worker_model = model
-
-        # master model
-        self.model = model(self.env.observation_space.shape[0], self.env.action_space.n)
-
-        # shared optimizer
-        if shared_optimizer:
-            self.optimizer = SharedAdam(self.model.parameters(), lr=lr)
-            self.optimizer.share_memory()
-        else:
-            self.optimizer = None
-
-        # hyper parameters setting
-        self.lr = lr
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-        self.max_norm_grad = 1
-        self.episodes_n = 20
-
-        # container for worker process
-        self.workers = []
-
-    def train(self):
-        """Train model."""
-        lock = mp.Lock()
-        for rank in range(self.process_n):
-            worker = Worker(
-                rank,
-                self.seed,
-                self.env_name,
-                self.lr,
-                self.worker_model,
-                self.model,
-                self.optimizer,
-                self.gamma,
-                self.gae_lambda,
-                self.entropy_coef,
-                self.value_loss_coef,
-                self.max_norm_grad,
-                self.episodes_n,
-            )
-            p = mp.Process(target=worker.train, args=())
-            p.start()
-            self.workers.append(p)
-
-        for p in self.workers:
-            p.join()
-
-    def test(self):
-        """Test model."""
-        worker = Worker(
-            10,
-            self.seed,
-            self.env_name,
-            self.lr,
-            self.worker_model,
-            self.model,
-            self.optimizer,
-            self.gamma,
-            self.gae_lambda,
-            self.entropy_coef,
-            self.value_loss_coef,
-            self.max_norm_grad,
-            self.episodes_n,
-        )
-        p = mp.Process(target=worker.test, args=())
-        p.start()
-        p.join()

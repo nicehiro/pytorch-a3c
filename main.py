@@ -1,20 +1,15 @@
 import argparse
 import os
+from shared_optim import SharedAdam
 import torch
 import gym
-from agent import Master
+from agent import Worker, Player
 from model import AC
+from movan import Net
 
 
 parser = argparse.ArgumentParser(description="PyTorch A3C Algorithm")
 
-parser.add_argument(
-    "--epochs",
-    type=int,
-    default=20,
-    metavar="N",
-    help="number of epochs to train (default: 10)",
-)
 parser.add_argument(
     "--lr",
     type=float,
@@ -44,7 +39,7 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--shared_optimizer", default=False, help="use an optimizer without shared momentum"
+    "--shared-optimizer", default=True, help="use an optimizer without shared momentum"
 )
 
 parser.add_argument(
@@ -62,7 +57,7 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--entropy_coef",
+    "--entropy-coef",
     type=float,
     default=0.01,
     help="entropy term coefficient (default: 0.01)",
@@ -75,6 +70,8 @@ parser.add_argument(
     help="value loss coefficient (default: 0.5)",
 )
 
+parser.add_argument("--episodes-n", type=int, default=3000, help="episode number")
+
 
 if __name__ == "__main__":
     # not to use OMP threads in numpy process
@@ -82,26 +79,41 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # cuda settings
-    use_cuda = args.cuda and torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-
     # set torch seed
     torch.manual_seed(args.seed)
 
-    # training
-    agent = Master(
-        args.num_process,
-        args.seed,
-        args.env_name,
-        args.lr,
-        AC,
-        args.shared_optimizer,
-        args.gamma,
-        args.gae_lambda,
-        args.entropy_coef,
-        args.value_loss_coef,
-    )
-    agent.train()
-    # testing
-    agent.test()
+    env = gym.make(args.env_name)
+    master_model = AC(env.observation_space.shape[0], env.action_space.n)
+    master_model.share_memory()
+
+    shared_adam = SharedAdam(master_model.parameters(), lr=args.lr)
+
+    workers = [
+        Worker(
+            rank,
+            args.seed,
+            args.env_name,
+            args.lr,
+            AC,
+            master_model,
+            shared_adam,
+            args.gamma,
+            args.gae_lambda,
+            args.entropy_coef,
+            args.value_loss_coef,
+            1,
+            args.episodes_n,
+        )
+        for rank in range(args.num_process)
+    ]
+
+    for w in workers:
+        w.start()
+
+    # test
+    player = Player(args.env_name, args.episodes_n, master_model)
+    player.start()
+
+    for w in workers:
+        w.join()
+    player.join()
