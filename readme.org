@@ -3,4 +3,6 @@
 - gae
 
 
-Most of code are come from https://github.com/ikostrikov/pytorch-a3c and https://github.com/MorvanZhou/pytorch-A3C.
+* Notions:
+- Most of code are come from https://github.com/ikostrikov/pytorch-a3c and https://github.com/MorvanZhou/pytorch-A3C.
+- Model hidden layer cells cannot set too big. I still don't know why.
